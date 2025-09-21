@@ -1,353 +1,374 @@
 /*
- * Sistema de Créditos para Alunos
- * 
- * Este código implementa um sistema para consulta e débito de créditos de alunos
- * utilizando uma placa Wemos D1, um teclado 3x4 e um display LCD 16x2.
- * 
- * Funcionalidades:
- * - Entrada do RM (5 dígitos) via teclado 3x4
- * - Consulta de informações do aluno via API PHP
- * - Exibição do nome e créditos no display LCD
- * - Débito de créditos ao pressionar "#"
- * - Encerramento do ciclo ao pressionar "*"
+ * Sistema de Controle de Créditos
+ * Wemos D1 + Teclado 3x4 + LCD 16x2
  * 
  * Conexões:
- * - Teclado 3x4: Pinos D1, D2, D3, D4, D5, D6, D7
- * - LCD 16x2 (I2C): Pinos D2 (SDA), D1 (SCL)
+ * LCD I2C:
+ *   SDA -> D6 (GPIO12)
+ *   SCL -> D5 (GPIO14)
+ *   VCC -> 3.3V
+ *   GND -> GND
+ * 
+ * Teclado 3x4:
+ *   R1-R4 -> D0, D2, D4, D8 (linhas)
+ *   C1-C3 -> D10, D12, D13, D15 (colunas)
  */
 
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
-#include <WiFiClient.h>
-#include <Wire.h>
+#include <ArduinoJson.h>
 #include <LiquidCrystal_I2C.h>
 #include <Keypad.h>
-#include <ArduinoJson.h>
+#include <Wire.h>
 
-// Configurações do WiFi
-const char* ssid = "SUA_REDE_WIFI";
-const char* password = "SUA_SENHA_WIFI";
+// Configurações WiFi
+const char* ssid = "nome";
+const char* password = "senha";
 
-// Configurações da API
-const char* serverName = "http://seu_servidor/sistema_creditos/api/";
-String consultaEndpoint = "consulta.php?rm=";
-String debitarEndpoint = "debitar.php";
+// URL da API
+const char* apiBaseUrl = "Endereço da API";
 
-// Configurações do teclado 3x4
+// Configuração do LCD I2C
+LiquidCrystal_I2C lcd(0x27, 16, 2); // Endereço I2C pode ser 0x27 ou 0x3F
+
+// Configuração do teclado
 const byte ROWS = 4;
-const byte COLS = 3;
-char keys[ROWS][COLS] = {
-  {'1', '2', '3'},
-  {'4', '5', '6'},
-  {'7', '8', '9'},
-  {'*', '0', '#'}
+const byte COLS = 4;
+
+char hexaKeys[ROWS][COLS] = {
+  {'1', '2', '3','A'},
+  {'4', '5', '6','B'},
+  {'7', '8', '9','C'},
+  {'*', '0', '#','D'}
 };
-byte rowPins[ROWS] = {D1, D2, D3, D4}; // Conectar a R1, R2, R3, R4
-byte colPins[COLS] = {D5, D6, D7};     // Conectar a C1, C2, C3
-Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
-// Configurações do LCD
-LiquidCrystal_I2C lcd(0x27, 16, 2); // Endereço I2C 0x27, 16 colunas, 2 linhas
+byte rowPins[ROWS] = {D0, D2, D4, D8}; 
+byte colPins[COLS] = {D10, D12, D13, D15};    
 
-// Variáveis globais
-String rm = "";
+Keypad customKeypad = Keypad(makeKeymap(hexaKeys), rowPins, colPins, ROWS, COLS);
+
+String rmInput = "";
 String nomeAluno = "";
-int creditos = 0;
-bool alunoConsultado = false;
+int creditosAluno = 0;
+bool dadosCarregados = false;
+unsigned long lastKeyPress = 0;
+const unsigned long TIMEOUT_MS = 30000; // 30 segundos
+
+// Estados do sistema
+enum SystemState {
+  STATE_INIT,
+  STATE_INPUT_RM,
+  STATE_LOADING,
+  STATE_SHOW_INFO,
+  STATE_ERROR
+};
+
+SystemState currentState = STATE_INIT;
+String errorMessage = "";
 
 void setup() {
-  // Inicializa a comunicação serial
   Serial.begin(115200);
   
-  // Inicializa o LCD
-  Wire.begin(D2, D1); // SDA, SCL
-  lcd.begin();
+  // Configurar pinos I2C para LCD
+  Wire.begin(D5, D6); // SDA = D6 (GPIO12), SCL = D5 (GPIO14)
+  
+  // Inicializar LCD
+  lcd.init();
   lcd.backlight();
+  lcd.clear();
   
-  // Conecta ao WiFi
-  conectarWiFi();
+  // Conectar WiFi
+  connectWiFi();
   
-  // Exibe mensagem inicial
+  // Tela inicial
+  showInitScreen();
+  currentState = STATE_INPUT_RM;
+}
+
+void loop() {
+  char key = customKeypad.getKey();
+  
+  if (key) {
+    lastKeyPress = millis();
+    handleKeyPress(key);
+  }
+  
+  // Timeout - voltar ao início
+  if (millis() - lastKeyPress > TIMEOUT_MS && currentState != STATE_INIT) {
+    resetSystem();
+  }
+  
+  delay(100);
+}
+
+void connectWiFi() {
+  lcd.setCursor(0, 0);
+  lcd.print("Conectando WiFi");
+  lcd.setCursor(0, 1);
+  lcd.print("Aguarde...");
+  
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("");
+    Serial.println("WiFi conectado!");
+    Serial.println("IP: " + WiFi.localIP().toString());
+  } else {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Erro WiFi!");
+    lcd.setCursor(0, 1);
+    lcd.print("Verifique config");
+    delay(3000);
+  }
+}
+
+void showInitScreen() {
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("Sistema Creditos");
   lcd.setCursor(0, 1);
-  lcd.print("Digite o RM:");
+  lcd.print("Digite RM:");
+  rmInput = "";
+  dadosCarregados = false;
 }
 
-void loop() {
-  char key = keypad.getKey();
-  
-  if (key) {
-    // Se o aluno já foi consultado e está no modo de operação
-    if (alunoConsultado) {
-      if (key == '#') {
-        // Debita um crédito
-        debitarCredito();
-      } else if (key == '*') {
-        // Volta para o modo de entrada de RM
-        resetarSistema();
-      }
+void handleKeyPress(char key) {
+  Serial.println("Tecla pressionada: " + String(key));
+  lcd.setCursor(11, 1);
+  lcd.print(String(key));  
+  switch (currentState) {
+    case STATE_INPUT_RM:
+      handleInputRM(key);
+      break;
+      
+    case STATE_SHOW_INFO:
+      handleShowInfo(key);
+      break;
+      
+    default:
+      break;
+  }
+}
+
+void handleInputRM(char key) {
+  if (key >= '0' && key <= '9') {
+    if (rmInput.length() < 5) {
+      rmInput += key;
+      updateRMDisplay();
+    }
+  }
+  else if (key == '#') {
+    if (rmInput.length() == 5) {
+      consultarAluno();
     } else {
-      // Modo de entrada de RM
-      if (key >= '0' && key <= '9') {
-        // Adiciona dígito ao RM se ainda não tiver 5 dígitos
-        if (rm.length() < 5) {
-          rm += key;
-          atualizarDisplayRM();
-        }
-      } else if (key == '#' && rm.length() == 5) {
-        // Consulta o aluno quando o RM estiver completo
-        consultarAluno();
-      } else if (key == '*') {
-        // Limpa o RM atual
-        rm = "";
-        atualizarDisplayRM();
-      }
+      showError("RM deve ter 5 dig");
+    }
+  }
+  else if (key == '*') {
+    if (rmInput.length() > 0) {
+      rmInput.remove(rmInput.length() - 1);
+      updateRMDisplay();
+    } else {
+      resetSystem();
     }
   }
 }
 
-void conectarWiFi() {
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Conectando WiFi");
-  
-  WiFi.begin(ssid, password);
-  
-  int tentativas = 0;
-  while (WiFi.status() != WL_CONNECTED && tentativas < 20) {
-    delay(500);
-    lcd.setCursor(tentativas % 16, 1);
-    lcd.print(".");
-    tentativas++;
+void handleShowInfo(char key) {
+  if (key == '#') {
+    debitarCredito();
   }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("WiFi Conectado!");
-    lcd.setCursor(0, 1);
-    lcd.print(WiFi.localIP());
-    delay(2000);
-  } else {
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Falha na conexao");
-    lcd.setCursor(0, 1);
-    lcd.print("Reiniciando...");
-    delay(3000);
-    ESP.restart();
+  else if (key == '*') {
+    resetSystem();
   }
 }
 
-void atualizarDisplayRM() {
+void updateRMDisplay() {
   lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Digite o RM:");
   lcd.setCursor(0, 1);
-  lcd.print(rm);
+  lcd.print("RM: " + rmInput);
+  // Limpar resto da linha
+  for (int i = rmInput.length() + 4; i < 16; i++) {
+    lcd.print(" ");
+    
+  }
 }
 
 void consultarAluno() {
-  if (WiFi.status() != WL_CONNECTED) {
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Erro de conexao");
-    lcd.setCursor(0, 1);
-    lcd.print("Tente novamente");
-    delay(2000);
-    resetarSistema();
-    return;
-  }
-  
+  currentState = STATE_LOADING;
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("Consultando...");
+  lcd.setCursor(0, 1);
+  lcd.print("Aguarde...");
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    showError("Sem conexao WiFi");
+    return;
+  }
   
   WiFiClient client;
   HTTPClient http;
   
-  String url = String(serverName) + consultaEndpoint + rm;
+  String url = String(apiBaseUrl) + "/aluno/" + rmInput;
+  
   http.begin(client, url);
+  http.addHeader("Content-Type", "application/json");
   
   int httpResponseCode = http.GET();
   
   if (httpResponseCode == 200) {
     String payload = http.getString();
+    Serial.println("Resposta API: " + payload);
     
-    // Aloca memória para o documento JSON
     DynamicJsonDocument doc(1024);
+    deserializeJson(doc, payload);
     
-    // Analisa o JSON
-    DeserializationError error = deserializeJson(doc, payload);
-    
-    if (!error) {
-      bool sucesso = doc["sucesso"];
-      
-      if (sucesso) {
-        nomeAluno = doc["nome"].as<String>();
-        creditos = doc["creditos"];
-        alunoConsultado = true;
-        
-        // Exibe as informações do aluno
-        exibirInfoAluno();
-      } else {
-        lcd.clear();
-        lcd.setCursor(0, 0);
-        lcd.print("Erro na consulta");
-        lcd.setCursor(0, 1);
-        lcd.print("Tente novamente");
-        delay(2000);
-        resetarSistema();
-      }
+    if (doc["success"]) {
+      nomeAluno = doc["data"]["nome"].as<String>();
+      creditosAluno = doc["data"]["creditos"];
+      dadosCarregados = true;
+      showAlunoInfo();
+      currentState = STATE_SHOW_INFO;
     } else {
-      lcd.clear();
-      lcd.setCursor(0, 0);
-      lcd.print("Erro no formato");
-      lcd.setCursor(0, 1);
-      lcd.print("Tente novamente");
-      delay(2000);
-      resetarSistema();
+      showError("Aluno nao encontr");
     }
-  } else {
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Erro HTTP: ");
-    lcd.print(httpResponseCode);
-    delay(2000);
-    resetarSistema();
+  }
+  else if (httpResponseCode == 404) {
+    showError("RM nao encontrado");
+  }
+  else {
+    showError("Erro servidor");
+    Serial.println("Código erro: " + String(httpResponseCode));
   }
   
   http.end();
 }
 
-void exibirInfoAluno() {
+void showAlunoInfo() {
   lcd.clear();
   
-  // Exibe o nome do aluno (truncado se necessário)
-  lcd.setCursor(0, 0);
-  if (nomeAluno.length() > 16) {
-    lcd.print(nomeAluno.substring(0, 16));
-  } else {
-    lcd.print(nomeAluno);
+  // Mostrar nome (máximo 16 caracteres)
+  String nomeDisplay = nomeAluno;
+  if (nomeDisplay.length() > 16) {
+    nomeDisplay = nomeDisplay.substring(0, 16);
   }
   
-  // Exibe os créditos
-  lcd.setCursor(0, 1);
-  lcd.print("Creditos: ");
-  lcd.print(creditos);
+  lcd.setCursor(0, 0);
+  lcd.print(nomeDisplay);
   
-  // Exibe instruções no Serial para debug
-  Serial.println("Aluno consultado:");
-  Serial.println("RM: " + rm);
-  Serial.println("Nome: " + nomeAluno);
-  Serial.println("Créditos: " + String(creditos));
-  Serial.println("Pressione # para debitar ou * para sair");
+  // Mostrar créditos
+  lcd.setCursor(0, 1);
+  lcd.print("Creditos: " + String(creditosAluno));
+  
+  Serial.println("Mostrando info: " + nomeAluno + " - Créditos: " + String(creditosAluno));
 }
 
 void debitarCredito() {
-  if (creditos <= 0) {
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Sem creditos");
-    lcd.setCursor(0, 1);
-    lcd.print("Pressione *");
-    delay(2000);
-    exibirInfoAluno();
+  if (!dadosCarregados) {
+    showError("Dados nao carregad");
     return;
   }
   
-  if (WiFi.status() != WL_CONNECTED) {
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Erro de conexao");
-    lcd.setCursor(0, 1);
-    lcd.print("Tente novamente");
+  if (creditosAluno <= 0) {
+    showError("Sem creditos!");
     delay(2000);
-    exibirInfoAluno();
+    showAlunoInfo();
     return;
   }
   
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("Debitando...");
+  lcd.setCursor(0, 1);
+  lcd.print("Aguarde...");
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    showError("Sem conexao WiFi");
+    return;
+  }
   
   WiFiClient client;
   HTTPClient http;
   
-  String url = String(serverName) + debitarEndpoint;
+  String url = String(apiBaseUrl) + "/debitar";
+  
   http.begin(client, url);
+  http.addHeader("Content-Type", "application/json");
   
-  // Especifica o tipo de conteúdo
-  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  // Preparar JSON
+  DynamicJsonDocument doc(256);
+  doc["rm"] = rmInput.toInt();
   
-  // Envia a requisição POST com o RM
-  String httpRequestData = "rm=" + rm;
-  int httpResponseCode = http.POST(httpRequestData);
+  String jsonString;
+  serializeJson(doc, jsonString);
+  
+  int httpResponseCode = http.POST(jsonString);
   
   if (httpResponseCode == 200) {
     String payload = http.getString();
+    Serial.println("Resposta débito: " + payload);
     
-    // Aloca memória para o documento JSON
-    DynamicJsonDocument doc(1024);
+    DynamicJsonDocument responseDoc(1024);
+    deserializeJson(responseDoc, payload);
     
-    // Analisa o JSON
-    DeserializationError error = deserializeJson(doc, payload);
-    
-    if (!error) {
-      bool sucesso = doc["sucesso"];
+    if (responseDoc["success"]) {
+      creditosAluno = responseDoc["data"]["creditos_atual"];
       
-      if (sucesso) {
-        creditos = doc["creditos"];
-        
-        lcd.clear();
-        lcd.setCursor(0, 0);
-        lcd.print("Credito debitado");
-        lcd.setCursor(0, 1);
-        lcd.print("Restantes: ");
-        lcd.print(creditos);
-        delay(2000);
-        exibirInfoAluno();
-      } else {
-        lcd.clear();
-        lcd.setCursor(0, 0);
-        lcd.print("Erro ao debitar");
-        lcd.setCursor(0, 1);
-        lcd.print("Tente novamente");
-        delay(2000);
-        exibirInfoAluno();
-      }
-    } else {
+      // Mostrar confirmação
       lcd.clear();
       lcd.setCursor(0, 0);
-      lcd.print("Erro no formato");
+      lcd.print("Debito OK!");
       lcd.setCursor(0, 1);
-      lcd.print("Tente novamente");
+      lcd.print("Novo saldo: " + String(creditosAluno));
+      
       delay(2000);
-      exibirInfoAluno();
+      showAlunoInfo();
+    } else {
+      String erro = responseDoc["error"];
+      showError("Erro: " + erro);
     }
-  } else {
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Erro HTTP: ");
-    lcd.print(httpResponseCode);
-    delay(2000);
-    exibirInfoAluno();
+  }
+  else {
+    showError("Erro debito");
+    Serial.println("Código erro débito: " + String(httpResponseCode));
   }
   
   http.end();
 }
 
-void resetarSistema() {
-  rm = "";
-  nomeAluno = "";
-  creditos = 0;
-  alunoConsultado = false;
+void showError(String message) {
+  currentState = STATE_ERROR;
+  errorMessage = message;
   
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print("Sistema Creditos");
+  lcd.print("ERRO:");
   lcd.setCursor(0, 1);
-  lcd.print("Digite o RM:");
+  lcd.print(errorMessage);
+  
+  Serial.println("Erro: " + errorMessage);
+  
+  // Voltar automaticamente após 3 segundos
+  delay(3000);
+  resetSystem();
+}
+
+void resetSystem() {
+  Serial.println("Resetando sistema");
+  rmInput = "";
+  nomeAluno = "";
+  creditosAluno = 0;
+  dadosCarregados = false;
+  currentState = STATE_INPUT_RM;
+  showInitScreen();
+  lastKeyPress = millis();
 }
